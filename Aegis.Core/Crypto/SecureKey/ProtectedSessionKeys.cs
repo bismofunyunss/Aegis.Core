@@ -8,22 +8,37 @@ namespace Aegis.Core.Crypto.SecureKey
     internal sealed class ProtectedSessionKeys : IDisposable
     {
         // ============================================================
-        // SESSION KEK
+        // LIVE SESSION KEK
         //
-        // Random AES-256 key generated for this application session.
+        // Random AES-256 key.
         //
-        // It is held in SecureBuffer through AesKek.
+        // Stored through AesKek -> SecureBuffer.
+        //
+        // This exists only for the lifetime of the authenticated
+        // application session.
         // ============================================================
 
         private AesKek? _kek;
 
 
         // ============================================================
-        // WRAPPED KEY MATERIAL
+        // TPM-PROTECTED SESSION KEK
         //
-        // These are ciphertext/wrapped representations.
+        // RSA-OAEP-SHA256 encrypted AES-256 KEK.
         //
-        // They are NOT plaintext keys.
+        // This is ciphertext, not plaintext key material.
+        //
+        // RSA-2048 => 256 bytes.
+        // ============================================================
+
+        private byte[]? _wrappedKek;
+
+
+        // ============================================================
+        // AES-KW WRAPPED SESSION KEYS
+        //
+        // These contain encrypted versions of the actual key
+        // material.
         // ============================================================
 
         private byte[]? _wrappedAccountRootKey;
@@ -38,12 +53,11 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
         // ============================================================
-        // FILE ROOT KEY METADATA
+        // FILE ROOT SALT
         //
-        // The salt is not secret, so it does not need encryption.
+        // Not secret.
         //
-        // It is required to reconstruct FileRootKey because
-        // FileRootKey contains both the key material and its salt.
+        // Required when reconstructing FileRootKey.
         // ============================================================
 
         private byte[]? _fileRootSalt;
@@ -58,6 +72,7 @@ namespace Aegis.Core.Crypto.SecureKey
 
         private ProtectedSessionKeys(
             AesKek kek,
+            byte[] wrappedKek,
             byte[] wrappedAccountRootKey,
             byte[] wrappedFileRootKey,
             byte[] wrappedMemoryProtectionKey,
@@ -69,6 +84,11 @@ namespace Aegis.Core.Crypto.SecureKey
                 kek
                 ?? throw new ArgumentNullException(
                     nameof(kek));
+
+            _wrappedKek =
+                wrappedKek
+                ?? throw new ArgumentNullException(
+                    nameof(wrappedKek));
 
             _wrappedAccountRootKey =
                 wrappedAccountRootKey
@@ -105,29 +125,27 @@ namespace Aegis.Core.Crypto.SecureKey
         // ============================================================
         // CREATE
         //
-        // Takes the existing typed key objects and immediately wraps
-        // their underlying SecureBuffer material.
+        // Creates a new random AES-256 session KEK.
         //
-        // After this method returns, this object contains ONLY:
+        // The KEK is:
         //
-        //     AES KEK
-        //     wrapped AccountRootKey
-        //     wrapped FileRootKey
-        //     wrapped MemoryProtectionKey
-        //     wrapped IpcWrappingKey
-        //     wrapped HmacKey
-        //     FileRoot salt
+        //     1. Protected by the TPM-backed RSA key.
+        //     2. Used as the AES-KW KEK for all five session keys.
         //
-        // It does NOT retain references to the original key objects.
+        // The plaintext session KEK remains only inside AesKek.
         // ============================================================
 
         internal static ProtectedSessionKeys Create(
+            TpmRsaKeyProtector tpm,
             AccountRootKey accountRootKey,
             FileRootKey fileRootKey,
             MemoryProtectionKey memoryProtectionKey,
             IpcWrappingKey ipcWrappingKey,
             HmacKey hmacKey)
         {
+            ArgumentNullException.ThrowIfNull(
+                tpm);
+
             ArgumentNullException.ThrowIfNull(
                 accountRootKey);
 
@@ -146,22 +164,45 @@ namespace Aegis.Core.Crypto.SecureKey
 
             AesKek? kek = null;
 
+            byte[]? wrappedKek = null;
+
             byte[]? wrappedAccount = null;
             byte[]? wrappedFile = null;
             byte[]? wrappedMemory = null;
             byte[]? wrappedIpc = null;
             byte[]? wrappedHmac = null;
+
             byte[]? fileSalt = null;
 
 
             try
             {
                 // ====================================================
-                // GENERATE NEW RANDOM SESSION KEK
+                // CREATE RANDOM AES-256 SESSION KEK
                 // ====================================================
 
                 kek =
                     AesKek.Generate();
+
+
+                // ====================================================
+                // PROTECT SESSION KEK WITH TPM
+                //
+                // RSA-OAEP-SHA256
+                //
+                // Only the 32-byte KEK is sent through RSA.
+                // ====================================================
+
+                wrappedKek =
+                    tpm.ProtectKek(
+                        kek.Key);
+
+
+                if (wrappedKek.Length == 0)
+                {
+                    throw new CryptographicException(
+                        "TPM returned an empty wrapped KEK.");
+                }
 
 
                 // ====================================================
@@ -217,7 +258,7 @@ namespace Aegis.Core.Crypto.SecureKey
                 // ====================================================
                 // COPY FILE ROOT SALT
                 //
-                // Salt is metadata, not secret key material.
+                // Public metadata; not secret.
                 // ====================================================
 
                 fileSalt =
@@ -225,12 +266,13 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
                 // ====================================================
-                // TRANSFER OWNERSHIP
+                // CREATE FINAL OBJECT
                 // ====================================================
 
-                ProtectedSessionKeys result =
+                var result =
                     new ProtectedSessionKeys(
                         kek,
+                        wrappedKek,
                         wrappedAccount,
                         wrappedFile,
                         wrappedMemory,
@@ -239,15 +281,20 @@ namespace Aegis.Core.Crypto.SecureKey
                         fileSalt);
 
 
-                // Prevent cleanup below from destroying the data
-                // now owned by result.
+                // ====================================================
+                // OWNERSHIP TRANSFER
+                // ====================================================
+
                 kek = null;
+
+                wrappedKek = null;
 
                 wrappedAccount = null;
                 wrappedFile = null;
                 wrappedMemory = null;
                 wrappedIpc = null;
                 wrappedHmac = null;
+
                 fileSalt = null;
 
 
@@ -255,7 +302,19 @@ namespace Aegis.Core.Crypto.SecureKey
             }
             catch
             {
+                // ====================================================
+                // SECURE CLEANUP
+                // ====================================================
+
                 kek?.Dispose();
+
+
+                if (wrappedKek != null)
+                {
+                    CryptographicOperations.ZeroMemory(
+                        wrappedKek);
+                }
+
 
                 if (wrappedAccount != null)
                 {
@@ -263,11 +322,13 @@ namespace Aegis.Core.Crypto.SecureKey
                         wrappedAccount);
                 }
 
+
                 if (wrappedFile != null)
                 {
                     CryptographicOperations.ZeroMemory(
                         wrappedFile);
                 }
+
 
                 if (wrappedMemory != null)
                 {
@@ -275,11 +336,13 @@ namespace Aegis.Core.Crypto.SecureKey
                         wrappedMemory);
                 }
 
+
                 if (wrappedIpc != null)
                 {
                     CryptographicOperations.ZeroMemory(
                         wrappedIpc);
                 }
+
 
                 if (wrappedHmac != null)
                 {
@@ -287,11 +350,13 @@ namespace Aegis.Core.Crypto.SecureKey
                         wrappedHmac);
                 }
 
+
                 if (fileSalt != null)
                 {
                     CryptographicOperations.ZeroMemory(
                         fileSalt);
                 }
+
 
                 throw;
             }
@@ -299,11 +364,116 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
         // ============================================================
+        // CREATE FROM TPM-WRAPPED KEK
+        //
+        // This is useful if you later want to reconstruct the
+        // ProtectedSessionKeys object from its encrypted representation
+        // while the application is still running.
+        //
+        // TPM unwraps the AES KEK once.
+        // ============================================================
+
+        internal static ProtectedSessionKeys Open(
+            TpmRsaKeyProtector tpm,
+            byte[] wrappedKek,
+            byte[] wrappedAccountRootKey,
+            byte[] wrappedFileRootKey,
+            byte[] wrappedMemoryProtectionKey,
+            byte[] wrappedIpcWrappingKey,
+            byte[] wrappedHmacKey,
+            byte[] fileRootSalt)
+        {
+            ArgumentNullException.ThrowIfNull(
+                tpm);
+
+            ArgumentNullException.ThrowIfNull(
+                wrappedKek);
+
+            ArgumentNullException.ThrowIfNull(
+                wrappedAccountRootKey);
+
+            ArgumentNullException.ThrowIfNull(
+                wrappedFileRootKey);
+
+            ArgumentNullException.ThrowIfNull(
+                wrappedMemoryProtectionKey);
+
+            ArgumentNullException.ThrowIfNull(
+                wrappedIpcWrappingKey);
+
+            ArgumentNullException.ThrowIfNull(
+                wrappedHmacKey);
+
+            ArgumentNullException.ThrowIfNull(
+                fileRootSalt);
+
+
+            byte[]? plaintextKek = null;
+
+            AesKek? kek = null;
+
+            try
+            {
+                // ====================================================
+                // TPM UNWRAP
+                // ====================================================
+
+                plaintextKek =
+                    tpm.UnprotectKek(
+                        wrappedKek);
+
+
+                if (plaintextKek.Length != 32)
+                {
+                    throw new CryptographicException(
+                        "Invalid AES session KEK length.");
+                }
+
+
+                kek =
+                    new AesKek(
+                        plaintextKek);
+
+
+                // ====================================================
+                // COPY ALL WRAPPED MATERIAL
+                // ====================================================
+
+                var result =
+                    new ProtectedSessionKeys(
+                        kek,
+                        wrappedKek.ToArray(),
+                        wrappedAccountRootKey.ToArray(),
+                        wrappedFileRootKey.ToArray(),
+                        wrappedMemoryProtectionKey.ToArray(),
+                        wrappedIpcWrappingKey.ToArray(),
+                        wrappedHmacKey.ToArray(),
+                        fileRootSalt.ToArray());
+
+
+                kek = null;
+
+                return result;
+            }
+            catch
+            {
+                kek?.Dispose();
+
+                throw;
+            }
+            finally
+            {
+                if (plaintextKek != null)
+                {
+                    CryptographicOperations.ZeroMemory(
+                        plaintextKek);
+                }
+            }
+        }
+
+
+        // ============================================================
         // UNWRAP ACCOUNT ROOT KEY
-        //
-        // Creates a temporary plaintext AccountRootKey.
-        //
-        // The caller OWNS the returned object and must Dispose() it.
         // ============================================================
 
         internal AccountRootKey UnwrapAccountRootKey()
@@ -333,8 +503,6 @@ namespace Aegis.Core.Crypto.SecureKey
 
         // ============================================================
         // UNWRAP FILE ROOT KEY
-        //
-        // FileRootKey additionally requires its salt.
         // ============================================================
 
         internal FileRootKey UnwrapFileRootKey()
@@ -453,6 +621,88 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
         // ============================================================
+        // TPM-WRAPPED KEK EXPORT
+        //
+        // Useful if you need to store/transmit the protected
+        // representation within the application's lifetime.
+        //
+        // This returns ciphertext, NOT the plaintext KEK.
+        // ============================================================
+
+        internal byte[] ExportWrappedKek()
+        {
+            ThrowIfDisposed();
+
+            return _wrappedKek!
+                .ToArray();
+        }
+
+
+        // ============================================================
+        // EXPORT WRAPPED KEY MATERIAL
+        //
+        // These return ciphertext copies.
+        // ============================================================
+
+        internal byte[] ExportWrappedAccountRootKey()
+        {
+            ThrowIfDisposed();
+
+            return _wrappedAccountRootKey!
+                .ToArray();
+        }
+
+
+        internal byte[] ExportWrappedFileRootKey()
+        {
+            ThrowIfDisposed();
+
+            return _wrappedFileRootKey!
+                .ToArray();
+        }
+
+
+        internal byte[] ExportWrappedMemoryProtectionKey()
+        {
+            ThrowIfDisposed();
+
+            return _wrappedMemoryProtectionKey!
+                .ToArray();
+        }
+
+
+        internal byte[] ExportWrappedIpcWrappingKey()
+        {
+            ThrowIfDisposed();
+
+            return _wrappedIpcWrappingKey!
+                .ToArray();
+        }
+
+
+        internal byte[] ExportWrappedHmacKey()
+        {
+            ThrowIfDisposed();
+
+            return _wrappedHmacKey!
+                .ToArray();
+        }
+
+
+        // ============================================================
+        // FILE ROOT SALT
+        // ============================================================
+
+        internal byte[] ExportFileRootSalt()
+        {
+            ThrowIfDisposed();
+
+            return _fileRootSalt!
+                .ToArray();
+        }
+
+
+        // ============================================================
         // DISPOSE
         // ============================================================
 
@@ -467,7 +717,7 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
             // ========================================================
-            // DESTROY SESSION KEK
+            // DESTROY PLAINTEXT SESSION KEK
             // ========================================================
 
             _kek?.Dispose();
@@ -476,10 +726,20 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
             // ========================================================
+            // DESTROY TPM-WRAPPED KEK
+            // ========================================================
+
+            if (_wrappedKek != null)
+            {
+                CryptographicOperations.ZeroMemory(
+                    _wrappedKek);
+
+                _wrappedKek = null;
+            }
+
+
+            // ========================================================
             // DESTROY WRAPPED KEY BLOBS
-            //
-            // They're not plaintext, but there's no reason to retain
-            // them after the session has ended.
             // ========================================================
 
             if (_wrappedAccountRootKey != null)
@@ -490,6 +750,7 @@ namespace Aegis.Core.Crypto.SecureKey
                 _wrappedAccountRootKey = null;
             }
 
+
             if (_wrappedFileRootKey != null)
             {
                 CryptographicOperations.ZeroMemory(
@@ -497,6 +758,7 @@ namespace Aegis.Core.Crypto.SecureKey
 
                 _wrappedFileRootKey = null;
             }
+
 
             if (_wrappedMemoryProtectionKey != null)
             {
@@ -506,6 +768,7 @@ namespace Aegis.Core.Crypto.SecureKey
                 _wrappedMemoryProtectionKey = null;
             }
 
+
             if (_wrappedIpcWrappingKey != null)
             {
                 CryptographicOperations.ZeroMemory(
@@ -513,6 +776,7 @@ namespace Aegis.Core.Crypto.SecureKey
 
                 _wrappedIpcWrappingKey = null;
             }
+
 
             if (_wrappedHmacKey != null)
             {
@@ -524,7 +788,7 @@ namespace Aegis.Core.Crypto.SecureKey
 
 
             // ========================================================
-            // DESTROY METADATA COPY
+            // DESTROY SALT COPY
             // ========================================================
 
             if (_fileRootSalt != null)

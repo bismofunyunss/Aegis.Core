@@ -20,7 +20,7 @@ namespace Aegis.Core.Crypto.SecureKey
         // CREATE / OPEN TPM KEY
         // ============================================================
 
-        private TpmRsaKeyProtector(
+        internal TpmRsaKeyProtector(
             CngKey cngKey)
         {
             _cngKey =
@@ -119,9 +119,20 @@ namespace Aegis.Core.Crypto.SecureKey
                     nameof(kek));
             }
 
-            return _rsa.Encrypt(
-                kek.ToArray(),
-                RSAEncryptionPadding.OaepSHA256);
+            byte[] plaintext =
+                kek.ToArray();
+
+            try
+            {
+                return _rsa.Encrypt(
+                    plaintext,
+                    RSAEncryptionPadding.OaepSHA256);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(
+                    plaintext);
+            }
         }
 
 
@@ -137,16 +148,48 @@ namespace Aegis.Core.Crypto.SecureKey
         {
             ThrowIfDisposed();
 
-            if (protectedKek.Length == 0)
+            if (protectedKek.IsEmpty)
             {
                 throw new ArgumentException(
                     "Protected KEK cannot be empty.",
                     nameof(protectedKek));
             }
 
-            return _rsa.Decrypt(
-                protectedKek.ToArray(),
-                RSAEncryptionPadding.OaepSHA256);
+            byte[] ciphertext =
+                protectedKek.ToArray();
+
+            byte[]? plaintext = null;
+
+            try
+            {
+                plaintext =
+                    _rsa.Decrypt(
+                        ciphertext,
+                        RSAEncryptionPadding.OaepSHA256);
+
+                if (plaintext.Length != 32)
+                {
+                    throw new CryptographicException(
+                        "TPM returned an invalid KEK length.");
+                }
+
+                return plaintext;
+            }
+            catch
+            {
+                if (plaintext != null)
+                {
+                    CryptographicOperations.ZeroMemory(
+                        plaintext);
+                }
+
+                throw;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(
+                    ciphertext);
+            }
         }
 
 

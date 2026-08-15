@@ -291,12 +291,20 @@ internal sealed class VaultEngine
             // CREATE NEW RAM-ONLY PROTECTED KEY SET
             // =====================================================
 
+            // =====================================================
+            // CREATE NEW RAM-ONLY PROTECTED KEY SET
+            // =====================================================
+
             ProtectedSessionKeys protectedKeys = null!;
 
             try
             {
+                using TpmRsaKeyProtector keyProtector =
+                    TpmRsaKeyProtector.OpenOrCreate();
+
                 protectedKeys =
                     ProtectedSessionKeys.Create(
+                        keyProtector,
                         pending.AccountRootKey,
                         pending.FileRootKey,
                         pending.MemoryProtectionKey,
