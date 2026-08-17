@@ -140,7 +140,7 @@ namespace Aegis.Core.Logging
 
         public static void Log(
             Exception ex,
-            string context)
+            string context, string username)
         {
             try
             {
@@ -148,7 +148,9 @@ namespace Aegis.Core.Logging
                     Path.Combine(
                         Environment.GetFolderPath(
                             Environment.SpecialFolder.LocalApplicationData),
-                        "Aegis");
+                        "Aegis",
+                        "Users",
+                        username);
 
                 Directory.CreateDirectory(folder);
 

@@ -1,6 +1,7 @@
 ﻿using Aegis.Core.Crypto.SecureKey;
 using System;
 using System.Collections.Generic;
+using System.Security;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -80,6 +81,12 @@ internal sealed class ServerCryptoSession : IDisposable
         }
     }
 
+    private ServerCryptoSession GetAuthenticatedSession(ServerCryptoSession currentSession)
+    {
+        return currentSession
+               ?? throw new SecurityException(
+                   "No authenticated crypto session exists.");
+    }
 
     public void Dispose()
     {

@@ -106,11 +106,13 @@ public sealed class VaultIpcHost
     }
 
     private async Task HandleClient(
-    NamedPipeServerStream pipe,
-    CancellationToken ct)
+      NamedPipeServerStream pipe,
+      CancellationToken ct)
     {
         byte[] buffer = Array.Empty<byte>();
         byte[] outBytes = Array.Empty<byte>();
+        byte[]? plaintext = null;
+        byte[]? responsePlaintext = null;
 
         try
         {
@@ -138,7 +140,6 @@ public sealed class VaultIpcHost
                     "Invalid IPC message size.");
             }
 
-
             // =====================================================
             // READ REQUEST BODY
             // =====================================================
@@ -152,12 +153,8 @@ public sealed class VaultIpcHost
                 len,
                 ct);
 
-
             // =====================================================
-            // DESERIALIZE REQUEST
-            //
-            // We deserialize IpcRequest first so we can determine
-            // whether this is a bootstrap command.
+            // DETERMINE BOOTSTRAP
             // =====================================================
 
             var request =
@@ -178,6 +175,10 @@ public sealed class VaultIpcHost
 
             Console.WriteLine(
                 $"SERVER: Is bootstrap={isBootstrap}");
+
+            // =====================================================
+            // BOOTSTRAP
+            // =====================================================
 
             if (isBootstrap)
             {
@@ -209,9 +210,8 @@ public sealed class VaultIpcHost
                 return;
             }
 
-
             // =====================================================
-            // SECURE REQUESTS ONLY
+            // SECURE REQUEST
             // =====================================================
 
             Console.WriteLine(
@@ -223,17 +223,33 @@ public sealed class VaultIpcHost
                 ?? throw new SecurityException(
                     "Invalid secure envelope.");
 
+            Console.WriteLine(
+                $"SERVER: Secure envelope SessionId={envelope.SessionId}");
+
+            Console.WriteLine(
+                $"SERVER: Secure envelope Counter={envelope.Counter}");
+
+            Console.WriteLine(
+                $"SERVER: Secure envelope Command={envelope.Command}");
+
+            // =====================================================
+            // GET SESSION
+            //
+            // Do NOT advance the replay counter yet.
+            // =====================================================
+
             var state =
-                ServerCryptoSessionStore.Validate(
-                    envelope.SessionId,
-                    envelope.Counter);
+                ServerCryptoSessionStore.Get(
+                    envelope.SessionId);
 
+            Console.WriteLine(
+                "SERVER: Session located.");
 
             // =====================================================
-            // DECRYPT REQUEST
+            // DECRYPT / AUTHENTICATE REQUEST
             // =====================================================
 
-            byte[] plaintext =
+            plaintext =
                 VaultTransport.DecryptIncoming(
                     state.Session.IpcSessionKey.Export(),
                     envelope,
@@ -241,110 +257,157 @@ public sealed class VaultIpcHost
                     envelope.Counter,
                     envelope.Command);
 
-            try
+            Console.WriteLine(
+                "SERVER: Request decrypted.");
+
+            // =====================================================
+            // DESERIALIZE DECRYPTED REQUEST
+            // =====================================================
+
+            var secureRequest =
+                JsonSerializer.Deserialize<IpcRequest>(
+                    plaintext)
+                ?? throw new SecurityException(
+                    "Invalid decrypted request.");
+
+            Console.WriteLine(
+                $"SERVER: Command={secureRequest.Command}");
+
+            Console.WriteLine(
+                $"SERVER: Request SessionId={secureRequest.SessionId}");
+
+            Console.WriteLine(
+                $"SERVER: Request Counter={secureRequest.Counter}");
+
+            // =====================================================
+            // VERIFY ENVELOPE / REQUEST CONSISTENCY
+            // =====================================================
+
+            if (!string.Equals(
+                    secureRequest.SessionId,
+                    envelope.SessionId,
+                    StringComparison.Ordinal))
             {
-                var secureRequest =
-                    JsonSerializer.Deserialize<IpcRequest>(
-                        plaintext)
-                    ?? throw new SecurityException(
-                        "Invalid decrypted request.");
-
-                Console.WriteLine(
-                    "SERVER: Request decrypted.");
-
-                Console.WriteLine(
-                    $"SERVER: Command={secureRequest.Command}");
-
-
-                // =================================================
-                // HANDLE SECURE REQUEST
-                // =================================================
-
-                var secureResponse =
-                    await _router.HandleAsync(
-                        secureRequest);
-
-
-                // =================================================
-                // SERIALIZE RESPONSE
-                // =================================================
-
-                Console.WriteLine(
-                    "SERVER: Before response serialization.");
-
-                byte[] responsePlaintext =
-                    JsonSerializer.SerializeToUtf8Bytes(
-                        secureResponse);
-
-                try
-                {
-                    Console.WriteLine(
-                        $"SERVER: Response plaintext size={responsePlaintext.Length}");
-
-
-                    // =============================================
-                    // ENCRYPT RESPONSE
-                    // =============================================
-
-                    Console.WriteLine(
-                        "SERVER: Before response encryption.");
-
-                    var responseEnvelope =
-                        VaultTransport.EncryptOutgoing(
-                            state.Session.IpcSessionKey.Export(),
-                            responsePlaintext,
-                            envelope.SessionId,
-                            envelope.Counter,
-                            envelope.Command);
-
-                    Console.WriteLine(
-                        "SERVER: Response encrypted.");
-
-
-                    // =============================================
-                    // SERIALIZE ENVELOPE
-                    // =============================================
-
-                    outBytes =
-                        JsonSerializer.SerializeToUtf8Bytes(
-                            responseEnvelope);
-
-                    Console.WriteLine(
-                        $"SERVER: Response bytes={outBytes.Length}");
-
-
-                    // =============================================
-                    // WRITE RESPONSE
-                    // =============================================
-
-                    Console.WriteLine(
-                        "SERVER: Before pipe write.");
-
-                    await WriteMessageAsync(
-                        pipe,
-                        outBytes,
-                        ct);
-
-                    Console.WriteLine(
-                        "SERVER: After pipe write.");
-                }
-                finally
-                {
-                    CryptographicOperations.ZeroMemory(
-                        responsePlaintext);
-                }
+                throw new SecurityException(
+                    "Session ID mismatch.");
             }
-            finally
+
+            if (secureRequest.Counter !=
+                envelope.Counter)
             {
-                CryptographicOperations.ZeroMemory(
-                    plaintext);
+                throw new SecurityException(
+                    "Request counter mismatch.");
             }
+
+            if (!string.Equals(
+                    secureRequest.Command,
+                    envelope.Command,
+                    StringComparison.Ordinal))
+            {
+                throw new SecurityException(
+                    "Command mismatch.");
+            }
+
+            // =====================================================
+            // REPLAY CHECK
+            //
+            // IMPORTANT:
+            // This is the ONLY place the incoming counter should
+            // be consumed.
+            // =====================================================
+
+            ServerCryptoSessionStore.Validate(
+                envelope.SessionId,
+                envelope.Counter);
+
+            Console.WriteLine(
+                "SERVER: Counter accepted.");
+
+            // =====================================================
+            // HANDLE SECURE REQUEST
+            // =====================================================
+
+            var secureResponse =
+                await _router.HandleAsync(
+                    secureRequest);
+
+            // =====================================================
+            // SERIALIZE RESPONSE
+            // =====================================================
+
+            Console.WriteLine(
+                "SERVER: Before response serialization.");
+
+            responsePlaintext =
+                JsonSerializer.SerializeToUtf8Bytes(
+                    secureResponse);
+
+            Console.WriteLine(
+                $"SERVER: Response plaintext size={responsePlaintext.Length}");
+
+            // =====================================================
+            // ENCRYPT RESPONSE
+            //
+            // Same authenticated session/counter/command.
+            // =====================================================
+
+            Console.WriteLine(
+                "SERVER: Before response encryption.");
+
+            var responseEnvelope =
+                VaultTransport.EncryptOutgoing(
+                    state.Session.IpcSessionKey.Export(),
+                    responsePlaintext,
+                    envelope.SessionId,
+                    envelope.Counter,
+                    envelope.Command);
+
+            Console.WriteLine(
+                "SERVER: Response encrypted.");
+
+            // =====================================================
+            // SERIALIZE RESPONSE ENVELOPE
+            // =====================================================
+
+            outBytes =
+                JsonSerializer.SerializeToUtf8Bytes(
+                    responseEnvelope);
+
+            Console.WriteLine(
+                $"SERVER: Response bytes={outBytes.Length}");
+
+            // =====================================================
+            // WRITE RESPONSE
+            // =====================================================
+
+            Console.WriteLine(
+                "SERVER: Before pipe write.");
+
+            await WriteMessageAsync(
+                pipe,
+                outBytes,
+                ct);
+
+            Console.WriteLine(
+                "SERVER: After pipe write.");
         }
         finally
         {
             // =====================================================
             // SECURE CLEANUP
             // =====================================================
+
+            if (plaintext != null)
+            {
+                CryptographicOperations.ZeroMemory(
+                    plaintext);
+            }
+
+            if (responsePlaintext != null)
+            {
+                CryptographicOperations.ZeroMemory(
+                    responsePlaintext);
+            }
 
             if (buffer.Length > 0)
             {

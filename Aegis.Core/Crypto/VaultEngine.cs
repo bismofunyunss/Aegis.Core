@@ -1,42 +1,27 @@
-﻿using Aegis.Contracts;
+﻿using System.Security;
+using System.Security.Cryptography;
+using Aegis.Contracts;
 using Aegis.Core.Authentication;
 using Aegis.Core.Crypto.SecureKey;
 using Aegis.Core.FileEncryption;
 using Aegis.Core.Progress;
 using Aegis.Core.Storage;
 using Aegis.Core.Tpm;
-using Org.BouncyCastle.Ocsp;
-using Org.BouncyCastle.Utilities.Collections;
 using OtpNet;
-using System.Security;
-using System.Security.Cryptography;
-using KeyBlob = Aegis.Contracts.KeyBlob;
 using TotpEnrollment = Aegis.Contracts.TotpEnrollment;
 
 namespace Aegis.Core.Crypto;
 
 internal sealed class VaultEngine
 {
-    private readonly TpmSealService _tpm;
-
     private readonly FileEncryptionService _fileEncryptionService;
 
     private readonly PendingAuthenticationStore
         _pendingAuthentications = new();
 
-    private readonly PendingTotpEnrollmentStore
-        _pendingTotpEnrollmentStore;
+    private readonly TpmSealService _tpm;
 
-    internal PendingTotpEnrollmentStore
-        PendingTotpEnrollmentStore =>
-        _pendingTotpEnrollmentStore;
-
-    private readonly PendingLoginAuthenticationStore
-        _pendingLoginAuthentications = new();
-
-    internal PendingLoginAuthenticationStore
-        PendingLoginAuthenticationStore =>
-        _pendingLoginAuthentications;
+    private ServerCryptoSession? _currentSession;
 
     internal VaultEngine(
         TpmSealService tpm)
@@ -48,9 +33,15 @@ internal sealed class VaultEngine
         _fileEncryptionService =
             new FileEncryptionService();
 
-        _pendingTotpEnrollmentStore =
+        PendingTotpEnrollmentStore =
             new PendingTotpEnrollmentStore();
     }
+
+    internal PendingTotpEnrollmentStore
+        PendingTotpEnrollmentStore { get; }
+
+    internal PendingLoginAuthenticationStore
+        PendingLoginAuthenticationStore { get; } = new();
 
     internal async Task<TotpEnrollment> RegisterAccount(
         byte[] userPassword,
@@ -77,37 +68,36 @@ internal sealed class VaultEngine
 
         keyStore.VerifyIntegrity(result.HmacKey);
 
-        byte[] totpSecret =
+        var totpSecret =
             RandomNumberGenerator.GetBytes(20);
 
         try
         {
-
-            string enrollmentId =
-                _pendingTotpEnrollmentStore.Add(
+            var enrollmentId =
+                PendingTotpEnrollmentStore.Add(
                     username,
                     result.HmacKey,
                     TimeSpan.FromMinutes(5));
 
-            string base32Secret =
+            var base32Secret =
                 Base32Encoding.ToString(
                     totpSecret);
 
-            string issuer =
+            var issuer =
                 "Aegis";
 
-            string account =
+            var account =
                 $"{issuer}:{username}";
 
-            string encodedIssuer =
+            var encodedIssuer =
                 Uri.EscapeDataString(
                     issuer);
 
-            string encodedAccount =
+            var encodedAccount =
                 Uri.EscapeDataString(
                     account);
 
-            string totpUri =
+            var totpUri =
                 $"otpauth://totp/{encodedAccount}" +
                 $"?secret={base32Secret}" +
                 $"&issuer={encodedIssuer}" +
@@ -119,19 +109,17 @@ internal sealed class VaultEngine
                 username,
                 totpSecret);
 
-            if (!_pendingTotpEnrollmentStore.TryGet(
+            if (!PendingTotpEnrollmentStore.TryGet(
                     enrollmentId,
                     out var pending) ||
                 pending == null)
-            {
                 throw new SecurityException(
                     "TOTP enrollment is invalid or expired.");
-            }
 
             return new TotpEnrollment
             {
-               EnrollmentId = enrollmentId,
-               Uri = totpUri
+                EnrollmentId = enrollmentId,
+                Uri = totpUri
             };
         }
         finally
@@ -153,7 +141,7 @@ internal sealed class VaultEngine
 
         try
         {
-            KeyBlob blob =
+            var blob =
                 keyStore.LoadKeyBlob();
 
             result =
@@ -185,8 +173,8 @@ internal sealed class VaultEngine
                     result.HmacKey,
                     TimeSpan.FromMinutes(5));
 
-            string authenticationId =
-                _pendingLoginAuthentications.Add(
+            var authenticationId =
+                PendingLoginAuthenticationStore.Add(
                     pending);
 
             // Ownership transferred.
@@ -204,199 +192,249 @@ internal sealed class VaultEngine
     }
 
     internal ServerCryptoSession ConfirmLoginTotp(
-     string authenticationId,
-     string code)
+        string authenticationId,
+        string code)
     {
-        Console.WriteLine(
-            "SERVER: ConfirmLoginTotp entered.");
+        if (string.IsNullOrWhiteSpace(authenticationId))
+            throw new SecurityException(
+                "Authentication is invalid or expired.");
 
-        if (!_pendingLoginAuthentications.TryGet(
+        if (string.IsNullOrWhiteSpace(code))
+            throw new SecurityException(
+                "Invalid authentication code.");
+
+        if (!PendingLoginAuthenticationStore.TryGet(
                 authenticationId,
                 out var pending) ||
             pending == null)
-        {
             throw new SecurityException(
                 "Authentication is invalid or expired.");
-        }
-
-        if (pending.IsExpired)
-        {
-            _pendingLoginAuthentications
-                .Remove(
-                    authenticationId);
-
-            throw new SecurityException(
-                "Authentication is invalid or expired.");
-        }
 
         var keyStore =
             new KeyStore(
                 pending.Username);
 
-        byte[] secret = Array.Empty<byte>();
+        byte[]? secret = null;
 
         try
         {
             // =====================================================
-            // VERIFY TOTP
+            // AUTHENTICATE KEYSTORE
             // =====================================================
+
+            keyStore.AttachHmacKey(
+                pending.HmacKey);
 
             keyStore.VerifyIntegrity(
                 pending.HmacKey);
 
+            // =====================================================
+            // LOAD TOTP SECRET
+            // =====================================================
+
             secret =
                 keyStore.LoadTotpSecret();
 
+            // =====================================================
+            // VERIFY TOTP
+            // =====================================================
+
             var totp =
-                new OtpNet.Totp(
-                    secret,
-                    step: 30,
-                    mode: OtpNet.OtpHashMode.Sha1,
-                    totpSize: 6);
+                new Totp(
+                    secret);
 
-            bool verified =
-                totp.VerifyTotp(
+            if (!totp.VerifyTotp(
                     code,
-                    out long step,
-                    new OtpNet.VerificationWindow(
-                        previous: 1,
-                        future: 1));
-
-            if (!verified)
-            {
+                    out var step,
+                    new VerificationWindow(
+                        1,
+                        1)))
                 throw new SecurityException(
                     "Invalid authentication code.");
-            }
 
-            long lastUsedStep =
-                keyStore.GetLastUsedTotpStep();
+            // =====================================================
+            // PREVENT TOTP REUSE
+            // =====================================================
 
-            if (step <= lastUsedStep)
-            {
+            if (step <=
+                keyStore.GetLastUsedTotpStep())
                 throw new SecurityException(
                     "Authentication code has already been used.");
-            }
 
             keyStore.UpdateLastUsedTotpStep(
                 step);
 
             // =====================================================
-            // TOTP PASSED
+            // TAKE PENDING AUTHENTICATION
             // =====================================================
 
-            Console.WriteLine(
-                "SERVER: TOTP authentication successful.");
-
-            // =====================================================
-            // CREATE NEW RAM-ONLY PROTECTED KEY SET
-            // =====================================================
-
-            // =====================================================
-            // CREATE NEW RAM-ONLY PROTECTED KEY SET
-            // =====================================================
-
-            ProtectedSessionKeys protectedKeys = null!;
+            PendingLoginAuthentication? taken = null;
 
             try
             {
-                using TpmRsaKeyProtector keyProtector =
-                    TpmRsaKeyProtector.OpenOrCreate();
-
-                protectedKeys =
-                    ProtectedSessionKeys.Create(
-                        keyProtector,
-                        pending.AccountRootKey,
-                        pending.FileRootKey,
-                        pending.MemoryProtectionKey,
-                        pending.IpcWrappingKey,
-                        pending.HmacKey);
-            }
-            catch
-            {
-                protectedKeys?.Dispose();
-                throw;
-            }
-
-            // =====================================================
-            // CREATE EPHEMERAL IPC SESSION KEY
-            // =====================================================
-
-            IpcSessionKey ipcSessionKey = null!;
-
-            try
-            {
-                ipcSessionKey =
-                    IpcSessionKey.CreateEphemeralIpcKey();
-
-                var session =
-                    new ServerCryptoSession(
-                        pending.Username,
-                        protectedKeys,
-                        ipcSessionKey);
-
-                protectedKeys = null!;
-                ipcSessionKey = null!;
-
-                // =================================================
-                // REMOVE PENDING AUTH
-                //
-                // This disposes the plaintext SecureBuffers.
-                // =================================================
-
-                bool removed =
-                    _pendingLoginAuthentications
-                        .Remove(
-                            authenticationId);
-
-                if (!removed)
-                {
-                    session.Dispose();
-
+                if (!PendingLoginAuthenticationStore.Take(
+                        authenticationId,
+                        out taken) ||
+                    taken == null)
                     throw new SecurityException(
-                        "Authentication state could not be finalized.");
-                }
+                        "Authentication is no longer valid.");
 
-                return session;
+                // =================================================
+                // CREATE PROTECTED SESSION KEYS
+                // =================================================
+
+                ProtectedSessionKeys? protectedKeys = null;
+                IpcSessionKey? ipcSession = null;
+
+                try
+                {
+                    using var keyProtector =
+                        TpmRsaKeyProtector.OpenOrCreate();
+
+                    protectedKeys =
+                        ProtectedSessionKeys.Create(
+                            keyProtector,
+                            taken.AccountRootKey,
+                            taken.FileRootKey,
+                            taken.MemoryProtectionKey,
+                            taken.IpcWrappingKey,
+                            taken.HmacKey);
+
+                    // =============================================
+                    // CREATE EPHEMERAL IPC SESSION KEY
+                    // =============================================
+
+                    ipcSession =
+                        IpcSessionKey.CreateEphemeralIpcKey();
+
+                    // =============================================
+                    // CREATE SERVER CRYPTO SESSION
+                    // =============================================
+
+                    var session =
+                        new ServerCryptoSession(
+                            taken.Username,
+                            protectedKeys,
+                            ipcSession);
+
+                    // =============================================
+                    // OWNERSHIP TRANSFER
+                    // =============================================
+
+                    protectedKeys = null;
+                    ipcSession = null;
+
+                    taken.Dispose();
+                    taken = null;
+
+                    return session;
+                }
+                finally
+                {
+                    protectedKeys?.Dispose();
+                    ipcSession?.Dispose();
+                }
             }
             catch
             {
-                ipcSessionKey?.Dispose();
-                protectedKeys?.Dispose();
-
+                taken?.Dispose();
                 throw;
             }
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(
-                secret);
+            if (secret != null)
+                CryptographicOperations.ZeroMemory(
+                    secret);
         }
     }
 
-    public async Task<FileOperationResult> EncryptFileAsync(
+    internal async Task<FileOperationResult> EncryptFileAsync(
         string inputPath,
-        ServerCryptoSession session,
-        string sessionId)
+        string sessionId,
+        CancellationToken cancellationToken = default)
     {
-        var progress = new Progress<double>(p =>
-        {
-            IpcProgressHub.Report(sessionId, p);
-        });
+        ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
 
-        return await _fileEncryptionService.EncryptAsync(
-            inputPath,
-            session,
-            progress);
+        var sessionState =
+            ServerCryptoSessionStore.Get(
+                sessionId);
+
+        var session =
+            sessionState.Session;
+
+        if (session == null)
+            throw new SecurityException(
+                "No authenticated crypto session.");
+
+        var progress =
+            new Progress<double>(p =>
+            {
+                IpcProgressHub.Report(
+                    sessionId,
+                    p);
+            });
+
+        var fileKeySalt =
+            RandomNumberGenerator.GetBytes(128);
+
+        try
+        {
+            using var fileKey =
+                session.CreateFileKey(
+                    fileKeySalt);
+
+            return await _fileEncryptionService.EncryptAsync(
+                inputPath,
+                fileKey,
+                fileKeySalt,
+                session.Username,
+                sessionId,
+                progress,
+                cancellationToken);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(
+                fileKeySalt);
+        }
     }
 
-    public async Task<FileOperationResult> DecryptFileAsync(
+
+    internal async Task<FileOperationResult> DecryptFileAsync(
         string inputPath,
-        ServerCryptoSession session,
-        IProgress<double>? progress = null)
+        string sessionId,
+        CancellationToken cancellationToken = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
+
+        var sessionState =
+            ServerCryptoSessionStore.Get(
+                sessionId);
+
+        var session =
+            sessionState.Session;
+
+        if (session == null)
+            throw new SecurityException(
+                "No authenticated crypto session.");
+
+        var progress =
+            new Progress<double>(p =>
+            {
+                IpcProgressHub.Report(
+                    sessionId,
+                    p);
+            });
+
         return await _fileEncryptionService.DecryptAsync(
             inputPath,
-            session,
-            progress);
+            salt =>
+                session.CreateFileKey(salt),
+            session.Username,
+            progress,
+            cancellationToken);
     }
 }

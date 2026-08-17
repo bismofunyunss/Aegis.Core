@@ -1,16 +1,14 @@
-﻿using Aegis.Contracts;
+﻿using System.Security;
+using System.Security.Cryptography;
+using System.Text.Json;
+using Aegis.Contracts;
 using Aegis.Core.Authentication;
 using Aegis.Core.Crypto;
+using Aegis.Core.Crypto.SecureKey;
 using Aegis.Core.Storage;
 using Aegis.Core.Tpm;
 using OtpNet;
-using System.Security;
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
-using Tpm2Lib;
 using VaultCore.IPC;
-using static Org.BouncyCastle.Math.EC.ECCurve;
 using ConfirmLoginTotpRequest = Aegis.Contracts.ConfirmLoginTotpRequest;
 
 namespace Aegis.Core.IPC;
@@ -18,6 +16,7 @@ namespace Aegis.Core.IPC;
 public sealed class CommandRouter
 {
     private readonly VaultEngine _vault;
+
     public CommandRouter()
     {
         var tpm = new TpmSealService(OpenTpm.CreateTpm());
@@ -31,45 +30,40 @@ public sealed class CommandRouter
                    $"Invalid payload for {typeof(T).Name}");
     }
 
-    public async Task<IpcResponse> HandleAsync(IpcRequest request)
+    public async Task<IpcResponse> HandleAsync(
+        IpcRequest request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+
         try
         {
-            Console.WriteLine(
-                $"ROUTER: Command=[{request.Command}]");
-
-            Console.WriteLine(
-                $"ROUTER: Command normalized=[{request.Command?.ToLowerInvariant()}]");
+            var command =
+                request.Command?
+                    .Trim()
+                    .ToLowerInvariant()
+                ?? string.Empty;
 
             // =========================================
             // SESSION VALIDATION
             // =========================================
 
-            bool requiresSession =
-                request.Command != "login" &&
-                request.Command != "register" &&
-                request.Command != "confirm-totp-enrollment" &&
-                request.Command != "confirm-login-totp";
+            var requiresSession =
+                command != "login" &&
+                command != "register" &&
+                command != "confirm-totp-enrollment" &&
+                command != "confirm-login-totp";
 
             if (requiresSession)
-            {
                 if (string.IsNullOrWhiteSpace(
                         request.SessionId))
-                {
                     return Error(
                         "Session is required.");
-                }
-
-                ServerCryptoSessionStore.Validate(
-                    request.SessionId,
-                    request.Counter);
-            }
 
             // =========================================
             // ROUTING
             // =========================================
-            Console.WriteLine(Encoding.UTF8.GetString(request.Payload));
-            return request.Command?.ToLowerInvariant() switch
+
+            return command switch
             {
                 "login" =>
                     await HandleLogin(
@@ -86,15 +80,16 @@ public sealed class CommandRouter
                         Deserialize<ConfirmTotpEnrollmentRequest>(
                             request.Payload)),
 
-             "confirm-login-totp" =>
-                    HandleConfirmLoginTotpDebug(Deserialize<ConfirmLoginTotpRequest>(
-                         request.Payload)),
+                "confirm-login-totp" =>
+                    HandleConfirmLoginTotpDebug(
+                        Deserialize<ConfirmLoginTotpRequest>(
+                            request.Payload)),
 
                 "encrypt" =>
                     await HandleEncryption(
                         request,
-                        Deserialize<EncryptFileRequest>(
-                            request.Payload)),
+                            Deserialize<EncryptFileRequest>(
+                                request.Payload)),
 
                 "decrypt" =>
                     await HandleDecryption(
@@ -102,12 +97,30 @@ public sealed class CommandRouter
                         Deserialize<DecryptFileRequest>(
                             request.Payload)),
 
-                _ => Error("Unknown command")
+                "logout" =>
+                    await HandleLogout(request),
+
+                _ =>
+                    Error(
+                        "Unknown command.")
             };
         }
         catch (Exception ex)
         {
-            return Error(ex.Message);
+            Console.WriteLine(
+                "ROUTER EXCEPTION:");
+
+            Console.WriteLine(
+                ex);
+
+            Console.WriteLine(
+                $"ROUTER EXCEPTION TYPE: {ex.GetType().FullName}");
+
+            Console.WriteLine(
+                $"ROUTER EXCEPTION MESSAGE: {ex.Message}");
+
+            return Error(
+                ex.Message);
         }
     }
 
@@ -148,7 +161,7 @@ public sealed class CommandRouter
             Console.WriteLine(
                 "SERVER: Before ConfirmTotpEnrollment.");
 
-             ConfirmTotpEnrollment(
+            ConfirmTotpEnrollment(
                 req.EnrollmentId,
                 req.Code);
 
@@ -176,7 +189,7 @@ public sealed class CommandRouter
     }
 
     private IpcResponse HandleConfirmLoginTotp(
-    ConfirmLoginTotpRequest req)
+        ConfirmLoginTotpRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.AuthenticationId) ||
             string.IsNullOrWhiteSpace(req.Code))
@@ -199,7 +212,7 @@ public sealed class CommandRouter
             Console.WriteLine(
                 "TOTP: Calling vault ConfirmLoginTotp.");
 
-            ServerCryptoSession session =
+            var session =
                 _vault.ConfirmLoginTotp(
                     req.AuthenticationId,
                     req.Code);
@@ -222,6 +235,9 @@ public sealed class CommandRouter
             var result =
                 new LoginResult
                 {
+                    Username =
+                        state.Username,
+
                     SessionId =
                         state.SessionId,
 
@@ -275,10 +291,8 @@ public sealed class CommandRouter
                 enrollmentId,
                 out var pending) ||
             pending == null)
-        {
             throw new SecurityException(
                 "TOTP enrollment is invalid or expired.");
-        }
 
         Console.WriteLine(
             $"SERVER: Pending enrollment found for {pending.Username}.");
@@ -293,7 +307,7 @@ public sealed class CommandRouter
         Console.WriteLine(
             "SERVER: KeyStore authenticated.");
 
-        byte[] secret =
+        var secret =
             keyStore.LoadTotpSecret();
 
         try
@@ -303,21 +317,16 @@ public sealed class CommandRouter
 
             var totp =
                 new Totp(
-                    secret,
-                    step: 30,
-                    mode: OtpNet.OtpHashMode.Sha1,
-                    totpSize: 6);
+                    secret);
 
             if (!totp.VerifyTotp(
                     code,
-                    out long step,
-                    new OtpNet.VerificationWindow(
-                        previous: 1,
-                        future: 1)))
-            {
+                    out var step,
+                    new VerificationWindow(
+                        1,
+                        1)))
                 throw new SecurityException(
                     "Invalid authentication code.");
-            }
 
             Console.WriteLine(
                 $"SERVER: TOTP verified. Step={step}");
@@ -350,10 +359,8 @@ public sealed class CommandRouter
             if (req.Username == null ||
                 req.Password == null ||
                 req.CryptoConfig == null)
-            {
                 return Error(
                     "Missing username or password");
-            }
 
             var result = await _vault.RegisterAccount(
                 req.Password,
@@ -366,10 +373,8 @@ public sealed class CommandRouter
         finally
         {
             if (req.Password != null)
-            {
                 CryptographicOperations.ZeroMemory(
                     req.Password);
-            }
         }
     }
 
@@ -383,10 +388,8 @@ public sealed class CommandRouter
         if (string.IsNullOrWhiteSpace(req.Username) ||
             req.Password == null ||
             req.Password.Length == 0)
-        {
             return Error(
                 "Invalid credentials");
-        }
 
         try
         {
@@ -397,7 +400,7 @@ public sealed class CommandRouter
             // It creates temporary pending authentication state.
             // =====================================================
 
-            string? authenticationId =
+            var authenticationId =
                 await _vault.BeginLogin(
                     req.Password,
                     req.Username);
@@ -440,8 +443,8 @@ public sealed class CommandRouter
     }
 
     internal ServerCryptoSession ConfirmLoginTotp(
-    string authenticationId,
-    string code)
+        string authenticationId,
+        string code)
     {
         if (string.IsNullOrWhiteSpace(authenticationId))
             throw new SecurityException(
@@ -455,12 +458,10 @@ public sealed class CommandRouter
                 authenticationId,
                 out var pending) ||
             pending == null)
-        {
             throw new SecurityException(
                 "Authentication is invalid or expired.");
-        }
 
-        KeyStore keyStore =
+        var keyStore =
             new KeyStore(
                 pending.Username);
 
@@ -475,7 +476,8 @@ public sealed class CommandRouter
             keyStore.AttachHmacKey(
                 pending.HmacKey);
 
-            keyStore.VerifyIntegrity();
+            keyStore.VerifyIntegrity(
+                pending.HmacKey);
 
             // =====================================================
             // LOAD TOTP SECRET
@@ -489,22 +491,17 @@ public sealed class CommandRouter
             // =====================================================
 
             var totp =
-                new OtpNet.Totp(
-                    secret,
-                    step: 30,
-                    mode: OtpNet.OtpHashMode.Sha1,
-                    totpSize: 6);
+                new Totp(
+                    secret);
 
             if (!totp.VerifyTotp(
                     code,
-                    out long step,
-                    new OtpNet.VerificationWindow(
-                        previous: 1,
-                        future: 1)))
-            {
+                    out var step,
+                    new VerificationWindow(
+                        1,
+                        1)))
                 throw new SecurityException(
                     "Invalid authentication code.");
-            }
 
             // =====================================================
             // PREVENT TOTP REUSE
@@ -512,20 +509,15 @@ public sealed class CommandRouter
 
             if (step <=
                 keyStore.GetLastUsedTotpStep())
-            {
                 throw new SecurityException(
                     "Authentication code has already been used.");
-            }
 
             keyStore.UpdateLastUsedTotpStep(
                 step);
 
             // =====================================================
-            // CREATE EPHEMERAL IPC SESSION KEY
+            // TAKE PENDING AUTHENTICATION
             // =====================================================
-
-            var ipcSession =
-                SessionKeyFactory.CreateEphemeralIpcKey();
 
             PendingLoginAuthentication? taken = null;
 
@@ -535,67 +527,153 @@ public sealed class CommandRouter
                         authenticationId,
                         out taken) ||
                     taken == null)
-                {
-                    ipcSession.Dispose();
-
                     throw new SecurityException(
                         "Authentication is no longer valid.");
+
+                // =================================================
+                // CREATE PROTECTED SESSION KEYS
+                // =================================================
+
+                ProtectedSessionKeys? protectedKeys = null;
+                IpcSessionKey? ipcSession = null;
+
+                try
+                {
+                    using var keyProtector =
+                        TpmRsaKeyProtector.OpenOrCreate();
+
+                    protectedKeys =
+                        ProtectedSessionKeys.Create(
+                            keyProtector,
+                            taken.AccountRootKey,
+                            taken.FileRootKey,
+                            taken.MemoryProtectionKey,
+                            taken.IpcWrappingKey,
+                            taken.HmacKey);
+
+                    // =============================================
+                    // CREATE EPHEMERAL IPC SESSION KEY
+                    // =============================================
+
+                    ipcSession =
+                        IpcSessionKey.CreateEphemeralIpcKey();
+
+                    // =============================================
+                    // CREATE SERVER CRYPTO SESSION
+                    // =============================================
+
+                    var session =
+                        new ServerCryptoSession(
+                            taken.Username,
+                            protectedKeys,
+                            ipcSession);
+
+                    // =============================================
+                    // OWNERSHIP TRANSFER
+                    // =============================================
+
+                    protectedKeys = null;
+                    ipcSession = null;
+
+                    taken.Dispose();
+                    taken = null;
+
+                    return session;
                 }
-
-                var session =
-                    new ServerCryptoSession(
-                        taken.Username,
-                        taken.AccountRootKey,
-                        taken.FileRootKey,
-                        taken.MemoryProtectionKey,
-                        taken.IpcWrappingKey,
-                        ipcSession,
-                        taken.HmacKey);
-
-                // Ownership transferred to ServerCryptoSession.
-                taken = null;
-
-                return session;
+                finally
+                {
+                    protectedKeys?.Dispose();
+                    ipcSession?.Dispose();
+                }
             }
             catch
             {
-                ipcSession.Dispose();
-
                 taken?.Dispose();
-
                 throw;
             }
         }
         finally
         {
             if (secret != null)
-            {
                 CryptographicOperations.ZeroMemory(
                     secret);
-            }
         }
+    }
+
+    private async Task<IpcResponse> HandleEncryptionDebug(
+        IpcRequest request)
+    {
+        Console.WriteLine(
+            "ROUTER: Entered encrypt handler.");
+
+        EncryptFileRequest req;
+
+        try
+        {
+            Console.WriteLine(
+                "ROUTER: Deserializing EncryptFileRequest.");
+
+            req =
+                Deserialize<EncryptFileRequest>(
+                    request.Payload);
+
+            Console.WriteLine(
+                $"ROUTER: InputPath={req.InputPath}");
+
+            Console.WriteLine(
+                $"ROUTER: Request.SessionId={request.SessionId}");
+
+            Console.WriteLine(
+                $"ROUTER: Payload.SessionId={req.SessionId}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(
+                $"ROUTER: Encrypt request deserialization failed: {ex}");
+
+            throw;
+        }
+
+        return await HandleEncryption(
+            request,
+            req);
     }
 
     private async Task<IpcResponse> HandleEncryption(
         IpcRequest request,
         EncryptFileRequest req)
     {
-        Console.WriteLine("SERVER: Starting encryption");
+        Console.WriteLine(
+            "SERVER: Starting encryption");
+
+        Console.WriteLine(
+            $"SERVER: Request SessionId={request.SessionId}");
+
+        Console.WriteLine(
+            $"SERVER: Request InputPath={req.InputPath}");
 
         var state =
-            ServerCryptoSessionStore.Get(request.SessionId);
+            ServerCryptoSessionStore.Get(
+                request.SessionId);
+
+        Console.WriteLine(
+            $"SERVER: Session found. " +
+            $"Username={state.Username}, " +
+            $"SessionId={state.SessionId}");
 
         var result =
             await _vault.EncryptFileAsync(
                 req.InputPath,
-                state.Session,
                 state.SessionId);
 
-        Console.WriteLine("SERVER: Encryption complete");
+        Console.WriteLine(
+            "SERVER: Encryption complete");
 
-        var response = Success(result);
+        var response =
+            Success(result);
 
-        Console.WriteLine("SERVER: Response created");
+        Console.WriteLine(
+            "SERVER: Response created");
 
         return response;
     }
@@ -624,7 +702,7 @@ public sealed class CommandRouter
             var result =
                 await _vault.DecryptFileAsync(
                     req.InputPath,
-                    state.Session);
+                    state.Session.SessionId);
 
 
             Console.WriteLine("SERVER: Decryption complete");
@@ -644,6 +722,40 @@ public sealed class CommandRouter
         }
     }
 
+    private Task<IpcResponse>? HandleLogout(
+        IpcRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.SessionId))
+            {
+                return Task.FromResult(
+                    Error("Session is required."));
+            }
+
+            if (ServerCryptoSessionStore.TryGet(
+                    request.SessionId,
+                    out var state) &&
+                state != null)
+            {
+                ServerCryptoSessionStore.Remove(
+                    request.SessionId);
+            }
+            else
+            {
+                return null;
+            }
+
+            return Task.FromResult(
+                Success(null));
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(
+                Error("Logout failed."));
+        }
+    }
+
     // =========================================================
     // HELPERS
     // =========================================================
@@ -657,7 +769,7 @@ public sealed class CommandRouter
                ?? throw new SecurityException("Invalid payload");
     }
 
-    private static IpcResponse Success(object data)
+    private static IpcResponse Success(object? data)
     {
         return new IpcResponse
         {
